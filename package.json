@@ -1,0 +1,16 @@
+{
+  "name": "cliq",
+  "version": "0.1.0",
+  "description": "Plataforma de agentes IA para WhatsApp",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "ruflo": "^3.5.48"
+  }
+}
