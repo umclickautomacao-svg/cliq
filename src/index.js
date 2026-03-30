@@ -9,6 +9,14 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.use(express.json());
 
+const CLIENTS = {
+  '1112302711964826': {
+    name: 'Um Click Automação',
+    systemPrompt: 'Você é o assistente virtual da Um Click Automação, especializada em automações para pequenas empresas. Seja direto, profissional e helpful.',
+    whatsappToken: process.env.WHATSAPP_TOKEN,
+  },
+};
+
 const MAX_HISTORY = 10;
 const CONVERSATION_TTL = 60 * 60 * 1000; // 1 hora em ms
 
@@ -121,19 +129,38 @@ app.post('/webhook/whatsapp', async (req, res) => {
   const message = change?.value?.messages?.[0];
   const phoneNumberId = change?.value?.metadata?.phone_number_id;
 
+  const client = CLIENTS[phoneNumberId];
+
   if (message?.text?.body) {
     const numero = message.from;
     const texto = message.text.body;
     console.log(`Mensagem de ${numero}: ${texto}`);
 
     try {
+      if (!client) {
+        console.warn(`Cliente não configurado para phone_number_id: ${phoneNumberId}`);
+        await fetch(`https://graph.facebook.com/v19.0/${phoneNumberId}/messages`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to: numero,
+            text: { body: 'Serviço não configurado para este número.' },
+          }),
+        });
+        return res.sendStatus(200);
+      }
+
       addMessage(numero, 'user', texto);
       const { messages } = getHistory(numero);
 
       const claudeResponse = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
-        system: 'Você é o Cliq, um assistente de atendimento via WhatsApp. Seja direto e útil.',
+        system: client.systemPrompt,
         messages,
       });
 
@@ -146,7 +173,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          'Authorization': `Bearer ${client.whatsappToken}`,
         },
         body: JSON.stringify({
           messaging_product: 'whatsapp',
