@@ -124,6 +124,7 @@ function initLead(numero, origem, anuncio) {
     dados: { origem, anuncio, servicos: [], tipoImovel: null, estagioObra: null, quantidades: {}, localizacao: null },
     skipSteps: [],
     quantidadeIndex: 0,
+    lastActivity: Date.now(),
   };
   return leadState[numero];
 }
@@ -284,7 +285,7 @@ async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
 
 // ─── Service extractor ───────────────────────────────────────────────────────
 
-async function extractServicos(texto) {
+async function extractServicos(texto, phoneNumberId, numero, token, state) {
   const prompt = `O cliente respondeu sobre os serviços que deseja. Extraia os serviços mencionados e responda APENAS com um JSON sem markdown: { "servicos": ["fechadura", "iluminacao", "sonorizacao", "cameras", "acesso", "internet", "automacao", "outro"] }. Inclua apenas os que o cliente mencionou. Mensagem: "${texto}"`;
   const r = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -292,9 +293,19 @@ async function extractServicos(texto) {
     messages: [{ role: 'user', content: prompt }],
   });
   try {
-    return JSON.parse(r.content[0].text).servicos ?? [];
+    const parsed = JSON.parse(r.content[0].text).servicos;
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('empty');
+    return parsed;
   } catch {
-    return ['outro'];
+    // fallback: ativa modo lista
+    state.servicoModoLista = true;
+    await sendTextMessage(phoneNumberId, numero, token, 'Não consegui entender. Pode escolher na lista abaixo?');
+    await sendInteractiveList(phoneNumberId, numero, token,
+      'Qual serviço você precisa?',
+      'Ver opções',
+      [{ title: 'Serviços', rows: SERVICOS_LIST.map((s) => ({ id: s.id, title: s.title })) }]
+    );
+    return null; // sinaliza fallback ativo
   }
 }
 
@@ -361,6 +372,14 @@ function cidadeAtendida(texto) {
 
 // ─── Google Sheets ────────────────────────────────────────────────────────────
 
+function buildConversationSummary(numero) {
+  const conv = conversationHistory.get(numero);
+  if (!conv?.messages?.length) return '';
+  const lines = conv.messages.map((m) => `${m.role === 'user' ? 'C' : 'A'}: ${m.content}`);
+  const full = lines.join(' | ');
+  return full.length > 200 ? full.slice(0, 197) + '...' : full;
+}
+
 async function appendLeadToSheet(dados) {
   try {
     const credsJson = process.env.GOOGLE_SHEETS_CREDENTIALS;
@@ -375,9 +394,10 @@ async function appendLeadToSheet(dados) {
     });
     const sheets = google.sheets({ version: 'v4', auth });
     const now = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    const resumo = buildConversationSummary(dados.telefone);
     await sheets.spreadsheets.values.append({
       spreadsheetId,
-      range: 'Sheet1!A:J',
+      range: 'Gráfico de Gantt!A:K',
       valueInputOption: 'USER_ENTERED',
       requestBody: {
         values: [[
@@ -391,6 +411,7 @@ async function appendLeadToSheet(dados) {
           dados.escolhaEncerramento ?? '',
           dados.origem ?? '',
           dados.anuncio ?? '',
+          resumo,
         ]],
       },
     });
@@ -399,11 +420,83 @@ async function appendLeadToSheet(dados) {
   }
 }
 
+// ─── Lead state persistente ───────────────────────────────────────────────────
+
+async function getSheetsClient() {
+  const credsJson = process.env.GOOGLE_SHEETS_CREDENTIALS;
+  const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
+  if (!credsJson || !spreadsheetId) return null;
+  const { google } = await import('googleapis');
+  const auth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(credsJson),
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  return { sheets: google.sheets({ version: 'v4', auth }), spreadsheetId };
+}
+
+async function saveLeadState(numero, state) {
+  try {
+    const client = await getSheetsClient();
+    if (!client) return;
+    const { sheets, spreadsheetId } = client;
+    const now = new Date().toISOString();
+    const stateJson = JSON.stringify(state);
+
+    // Procura linha existente com este telefone
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: 'Estados!A:A',
+    });
+    const rows = res.data.values ?? [];
+    const rowIdx = rows.findIndex((r) => r[0] === numero);
+
+    if (rowIdx >= 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `Estados!A${rowIdx + 1}:C${rowIdx + 1}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[numero, stateJson, now]] },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Estados!A:C',
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[numero, stateJson, now]] },
+      });
+    }
+  } catch (err) {
+    console.error('Erro ao salvar leadState no Sheets:', err.message);
+  }
+}
+
+async function loadAllLeadStates() {
+  try {
+    const client = await getSheetsClient();
+    if (!client) return;
+    const { sheets, spreadsheetId } = client;
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: 'Estados!A:C',
+    });
+    const rows = res.data.values ?? [];
+    for (const [numero, stateJson] of rows) {
+      if (!numero || !stateJson) continue;
+      try {
+        leadState[numero] = JSON.parse(stateJson);
+      } catch {}
+    }
+    console.log(`leadState carregado: ${Object.keys(leadState).length} leads`);
+  } catch (err) {
+    console.error('Erro ao carregar leadState do Sheets:', err.message);
+  }
+}
+
 // ─── Notificação pro Alê ──────────────────────────────────────────────────────
 
 const ALE_NUMERO = '5511971873887';
 
 async function notificarAle(phoneNumberId, token, dados) {
+  const hora = horaAtualSP();
+  const expediente = isHorarioComercial() ? 'dentro do expediente' : 'fora do expediente';
   const msg = [
     'Novo lead qualificado!',
     `Nome: ${dados.nome ?? '-'}`,
@@ -413,12 +506,29 @@ async function notificarAle(phoneNumberId, token, dados) {
     `Estágio: ${dados.estagioObra ?? '-'}`,
     `Cidade: ${dados.localizacao ?? '-'}`,
     `Escolha: ${dados.escolhaEncerramento ?? '-'}`,
+    `Horário: ${hora} (${expediente})`,
   ].join('\n');
   try {
     await sendTextMessage(phoneNumberId, ALE_NUMERO, token, msg);
   } catch (err) {
     console.error('Erro ao notificar Alê:', err.message);
   }
+}
+
+// ─── Horário comercial ────────────────────────────────────────────────────────
+
+function isHorarioComercial() {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+  const day = now.getDay(); // 0=dom, 6=sab
+  const hour = now.getHours();
+  const min = now.getMinutes();
+  if (day === 0) return false; // domingo fora
+  const minuteOfDay = hour * 60 + min;
+  return minuteOfDay >= 8 * 60 && minuteOfDay < 19 * 60;
+}
+
+function horaAtualSP() {
+  return new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -472,16 +582,43 @@ async function handleQualification(phoneNumberId, numero, token, texto, state, s
     return true;
   }
 
-  // ── servico: texto livre → Claude extrai serviços ──
+  // ── servico: texto livre ou lista (fallback) ──
   if (step === 'servico') {
     if (textoNorm === 'voltar') {
       await goBack(phoneNumberId, numero, token, state);
       return true;
     }
-    const servicos = await extractServicos(texto);
-    dados.servicos = servicos;
-    // pula quantidade se só tem "outro"
-    const temQtd = servicos.some((s) => s !== 'outro');
+
+    // modo lista: acumula seleções e aguarda "pronto"
+    if (state.servicoModoLista) {
+      const PRONTO_LISTA = /^(pronto|só isso|so isso|é só|e só|tudo|ok|fim|done|continuar)$/i;
+      if (PRONTO_LISTA.test(textoNorm)) {
+        if (dados.servicos.length === 0) {
+          await sendTextMessage(phoneNumberId, numero, token, 'Selecione ao menos um serviço antes de continuar.');
+          return true;
+        }
+      } else {
+        const selecionado = SERVICOS_LIST.find((s) => s.id === textoNorm || s.title.toLowerCase() === textoNorm);
+        if (selecionado) {
+          if (!dados.servicos.includes(selecionado.id)) dados.servicos.push(selecionado.id);
+          await sendTextMessage(phoneNumberId, numero, token,
+            `Anotado: ${selecionado.title}. Mais algum serviço ou digite 'pronto' para continuar.`
+          );
+          return true;
+        }
+        // item não reconhecido: reapresenta lista
+        await sendStepQuestion(phoneNumberId, numero, token, 'servico', state);
+        return true;
+      }
+    } else {
+      // modo texto livre: Claude extrai
+      const servicos = await extractServicos(texto, phoneNumberId, numero, token, state);
+      if (servicos === null) return true; // fallback ativado, aguarda próxima resposta
+      dados.servicos = servicos;
+    }
+
+    // avança
+    const temQtd = dados.servicos.some((s) => s !== 'outro');
     if (!temQtd && !state.skipSteps.includes('quantidade')) {
       state.skipSteps.push('quantidade');
     }
@@ -557,18 +694,17 @@ async function handleQualification(phoneNumberId, numero, token, texto, state, s
     if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
 
     const primeiroNome = extractFirstName(dados.nome);
-    const saudacaoNome = primeiroNome ? `${primeiroNome}` : null;
+    const n = primeiroNome ? `, ${primeiroNome}` : '';
+    const dentroHorario = isHorarioComercial();
 
-    const MSGS_ENCERRAMENTO = {
-      'receber proposta aqui': saudacaoNome
-        ? `Perfeito, ${saudacaoNome}. Para montar uma proposta precisa, o Alê vai entrar em contato para alinhar alguns detalhes como quantidades, projeto e preferências. Ele fala com você em breve!`
-        : 'Perfeito. Para montar uma proposta precisa, o Alê vai entrar em contato para alinhar alguns detalhes. Ele fala com você em breve!',
-      'agendar visita técnica': saudacaoNome
-        ? `Ótimo, ${saudacaoNome}. O Alê vai entrar em contato para agendar a visita técnica no melhor horário para você.`
-        : 'Ótimo. O Alê vai entrar em contato para agendar a visita técnica no melhor horário para você.',
-      'falar com consultor': saudacaoNome
-        ? `Certo, ${saudacaoNome}. O Alê já foi notificado e responde em instantes.`
-        : 'Certo. O Alê já foi notificado e responde em instantes.',
+    const MSGS_ENCERRAMENTO = dentroHorario ? {
+      'receber proposta aqui': `Perfeito${n}. Para montar uma proposta precisa, o Alê vai entrar em contato para alinhar detalhes como quantidades e preferências. Ele fala com você em breve!`,
+      'agendar visita técnica': `Ótimo${n}. O Engº Alê vai entrar em contato para agendar a visita técnica no melhor horário para você.`,
+      'falar com consultor':   `Certo${n}. O Engº Alê já foi notificado e responde em instantes.`,
+    } : {
+      'receber proposta aqui': `Perfeito${n}. Nosso horário de atendimento é de segunda a sábado, das 8h às 19h. O Engº Alê entra em contato no próximo dia útil para alinhar os detalhes da proposta.`,
+      'agendar visita técnica': `Ótimo${n}. Nosso horário de atendimento é de segunda a sábado, das 8h às 19h. O Alê entra em contato no próximo dia útil para agendar a visita.`,
+      'falar com consultor':   `Certo${n}. Nosso horário de atendimento é de segunda a sábado, das 8h às 19h. O Engº Alê recebeu sua mensagem e responde assim que possível.`,
     };
 
     dados.escolhaEncerramento = texto;
@@ -590,6 +726,8 @@ async function handleQualification(phoneNumberId, numero, token, texto, state, s
 
 const MAX_HISTORY = 10;
 const CONVERSATION_TTL = 60 * 60 * 1000;
+const INACTIVITY_30MIN = 30 * 60 * 1000;
+const INACTIVITY_24H   = 24 * 60 * 60 * 1000;
 
 const conversationHistory = new Map();
 
@@ -599,6 +737,36 @@ setInterval(() => {
     if (now - data.lastActivity > CONVERSATION_TTL) {
       conversationHistory.delete(numero);
       delete leadState[numero];
+    }
+  }
+}, 5 * 60 * 1000);
+
+// Timeout de inatividade durante qualificação
+setInterval(async () => {
+  const now = Date.now();
+  for (const [numero, state] of Object.entries(leadState)) {
+    if (state.step === 'livre') continue;
+    const inativo = now - (state.lastActivity ?? 0);
+    const phoneNumberId = state.phoneNumberId;
+    const token = state.whatsappToken;
+    if (!phoneNumberId || !token) continue;
+
+    if (inativo > INACTIVITY_24H) {
+      try {
+        await sendTextMessage(phoneNumberId, numero, token,
+          'Olá! Caso ainda tenha interesse em automação, estamos à disposição. É só mandar uma mensagem.'
+        );
+      } catch {}
+      delete leadState[numero];
+    } else if (inativo > INACTIVITY_30MIN) {
+      const primeiroNome = extractFirstName(state.dados?.nome);
+      const msg = primeiroNome
+        ? `Oi, ${primeiroNome}. Ainda tem interesse? Se quiser continuar, é só responder.`
+        : 'Oi! Ainda tem interesse? Se quiser continuar, é só responder.';
+      try {
+        await sendTextMessage(phoneNumberId, numero, token, msg);
+        state.lastActivity = now; // evita reenvio a cada 5min
+      } catch {}
     }
   }
 }, 5 * 60 * 1000);
@@ -702,6 +870,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
   if (!message) return res.sendStatus(200);
 
+  const MEDIA_TYPES = new Set(['audio', 'image', 'document', 'sticker', 'video', 'location']);
+  if (MEDIA_TYPES.has(message.type)) {
+    const token = CLIENTS[phoneNumberId]?.whatsappToken ?? process.env.WHATSAPP_TOKEN;
+    await sendTextMessage(phoneNumberId, message.from, token,
+      'Por enquanto consigo atender apenas por texto. Pode digitar sua mensagem?'
+    );
+    return res.sendStatus(200);
+  }
+
   // Extrai texto de mensagem de texto ou resposta interativa
   let texto = null;
   if (message.type === 'text') {
@@ -739,7 +916,10 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
       const analysis = await analyzeFirstMessage(texto, contexto);
       const state = initLead(numero, origem, anuncioInfo);
+      state.phoneNumberId = phoneNumberId;
+      state.whatsappToken = whatsappToken;
       state.dados.nome = isValidName(contactName) ? contactName : null;
+      await saveLeadState(numero, state);
       state.skipSteps = analysis.skipSteps ?? [];
       if (analysis.dados?.servicos?.length) state.dados.servicos = analysis.dados.servicos;
       if (analysis.dados?.quantidades) state.dados.quantidades = analysis.dados.quantidades;
@@ -762,11 +942,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
     }
 
     const state = leadState[numero];
+    state.lastActivity = Date.now();
 
     // ── QUALIFICAÇÃO em andamento ──
     if (state.step !== 'livre') {
       const handled = await handleQualification(phoneNumberId, numero, whatsappToken, texto, state, client.systemPrompt);
       if (handled !== false) {
+        await saveLeadState(numero, state);
         await upsertContact(numero, contactName);
         return res.sendStatus(200);
       }
@@ -805,6 +987,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Cliq rodando na porta ${PORT}`);
+  await loadAllLeadStates();
 });
