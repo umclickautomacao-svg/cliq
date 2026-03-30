@@ -121,7 +121,13 @@ function nextStepAfter(currentStep, skipSteps) {
   return 'livre';
 }
 
-const PRONTO_REGEX = /^(pronto|só isso|so isso|é só|e só|tudo|ok|fim|done|encerrar|terminar|continuar)$/i;
+function getPreviousStep(currentStep, skipSteps) {
+  const idx = STEP_ORDER.indexOf(currentStep);
+  for (let i = idx - 1; i >= 0; i--) {
+    if (!skipSteps.includes(STEP_ORDER[i])) return STEP_ORDER[i];
+  }
+  return null; // sem step anterior válido
+}
 
 // ─── WhatsApp helpers ─────────────────────────────────────────────────────────
 
@@ -178,29 +184,36 @@ async function sendInteractiveList(phoneNumberId, to, token, bodyText, buttonTex
 
 async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
   if (step === 'servico') {
-    await sendInteractiveList(phoneNumberId, numero, token,
-      'Qual serviço você precisa?',
-      'Ver opções',
-      [{ title: 'Serviços', rows: SERVICOS_LIST.map((s) => ({ id: s.id, title: s.title })) }]
-    );
     await sendTextMessage(phoneNumberId, numero, token,
-      "Selecione um serviço por vez. Quando terminar, digite 'pronto'."
+      "O que você tem interesse? Pode digitar tudo de uma vez, por exemplo: 'fechadura e sonorização' ou 'quero automatizar tudo'."
     );
     return;
   }
 
   if (step === 'imovel') {
-    await sendInteractiveButtons(phoneNumberId, numero, token,
+    await sendInteractiveList(phoneNumberId, numero, token,
       'Qual é o tipo do imóvel?',
-      [{ id: 'casa', title: 'Casa' }, { id: 'apartamento', title: 'Apartamento' }, { id: 'comercial', title: 'Comercial' }]
+      'Selecionar',
+      [{ title: 'Tipo de imóvel', rows: [
+        { id: 'casa',        title: 'Casa' },
+        { id: 'apartamento', title: 'Apartamento' },
+        { id: 'comercial',   title: 'Comercial' },
+        { id: 'voltar',      title: 'Voltar' },
+      ]}]
     );
     return;
   }
 
   if (step === 'estagio') {
-    await sendInteractiveButtons(phoneNumberId, numero, token,
+    await sendInteractiveList(phoneNumberId, numero, token,
       'Em que estágio está o imóvel?',
-      [{ id: 'pronto', title: 'Pronto/morando' }, { id: 'reforma', title: 'Em reforma' }, { id: 'construcao', title: 'Em construção' }]
+      'Selecionar',
+      [{ title: 'Estágio', rows: [
+        { id: 'pronto',    title: 'Pronto/morando' },
+        { id: 'reforma',   title: 'Em reforma' },
+        { id: 'construcao',title: 'Em construção' },
+        { id: 'voltar',    title: 'Voltar' },
+      ]}]
     );
     return;
   }
@@ -208,13 +221,17 @@ async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
   if (step === 'quantidade') {
     const servicos = state.dados.servicos.filter((s) => s !== 'outro');
     const idx = state.quantidadeIndex;
-    if (idx >= servicos.length) return; // será tratado pela lógica de avanço
+    if (idx >= servicos.length) return;
     const servico = servicos[idx];
-    const buttons = QUANTITY_BUTTONS[servico];
+    const qtdButtons = QUANTITY_BUTTONS[servico] ?? [];
     const label = SERVICOS_LIST.find((s) => s.id === servico)?.title ?? servico;
-    await sendInteractiveButtons(phoneNumberId, numero, token,
+    await sendInteractiveList(phoneNumberId, numero, token,
       `Quantas unidades para ${label}?`,
-      buttons
+      'Selecionar',
+      [{ title: 'Quantidade', rows: [
+        ...qtdButtons.map((b) => ({ id: b.id, title: b.title })),
+        { id: 'voltar', title: 'Voltar' },
+      ]}]
     );
     return;
   }
@@ -225,15 +242,33 @@ async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
   }
 
   if (step === 'encerramento') {
-    await sendInteractiveButtons(phoneNumberId, numero, token,
+    await sendInteractiveList(phoneNumberId, numero, token,
       'Ótimo! Coletamos tudo que precisamos. Como prefere prosseguir?',
-      [
-        { id: 'proposta', title: 'Receber proposta aqui' },
-        { id: 'visita', title: 'Agendar visita técnica' },
-        { id: 'consultor', title: 'Falar com consultor' },
-      ]
+      'Selecionar',
+      [{ title: 'Próximo passo', rows: [
+        { id: 'proposta',   title: 'Receber proposta aqui' },
+        { id: 'visita',     title: 'Agendar visita técnica' },
+        { id: 'consultor',  title: 'Falar com consultor' },
+        { id: 'voltar',     title: 'Voltar' },
+      ]}]
     );
     return;
+  }
+}
+
+// ─── Service extractor ───────────────────────────────────────────────────────
+
+async function extractServicos(texto) {
+  const prompt = `O cliente respondeu sobre os serviços que deseja. Extraia os serviços mencionados e responda APENAS com um JSON sem markdown: { "servicos": ["fechadura", "iluminacao", "sonorizacao", "cameras", "acesso", "internet", "automacao", "outro"] }. Inclua apenas os que o cliente mencionou. Mensagem: "${texto}"`;
+  const r = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 256,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  try {
+    return JSON.parse(r.content[0].text).servicos ?? [];
+  } catch {
+    return ['outro'];
   }
 }
 
@@ -257,63 +292,65 @@ async function analyzeFirstMessage(texto, contexto) {
 
 // ─── Qualification handler ────────────────────────────────────────────────────
 
+async function goBack(phoneNumberId, numero, token, state) {
+  const prev = getPreviousStep(state.step, state.skipSteps);
+  if (!prev) {
+    await sendTextMessage(phoneNumberId, numero, token, 'Você já está na primeira etapa.');
+    await sendStepQuestion(phoneNumberId, numero, token, state.step, state);
+    return;
+  }
+  // ao voltar para quantidade, reseta o índice
+  if (prev === 'quantidade') state.quantidadeIndex = 0;
+  state.step = prev;
+  await sendStepQuestion(phoneNumberId, numero, token, prev, state);
+}
+
 async function handleQualification(phoneNumberId, numero, token, texto, state) {
   const { step, dados } = state;
+  const textoNorm = texto.trim().toLowerCase();
 
-  // ── servico: múltipla seleção ──
+  // ── servico: texto livre → Claude extrai serviços ──
   if (step === 'servico') {
-    if (PRONTO_REGEX.test(texto.trim())) {
-      if (dados.servicos.length === 0) {
-        await sendTextMessage(phoneNumberId, numero, token, 'Selecione ao menos um serviço antes de continuar.');
-        return;
-      }
-      // adiciona "quantidade" a skipSteps se todos os serviços são "outro"
-      const next = nextStepAfter('servico', state.skipSteps);
-      state.step = next;
-      await sendStepQuestion(phoneNumberId, numero, token, next, state);
-      return;
+    if (textoNorm === 'voltar') {
+      await goBack(phoneNumberId, numero, token, state);
+      return true;
     }
-
-    // verifica se é seleção de serviço (lista interativa ou texto)
-    const servicoSelecionado = SERVICOS_LIST.find(
-      (s) => s.id === texto || s.title.toLowerCase() === texto.toLowerCase()
-    );
-    if (servicoSelecionado) {
-      if (!dados.servicos.includes(servicoSelecionado.id)) {
-        dados.servicos.push(servicoSelecionado.id);
-      }
-      const label = servicoSelecionado.title;
-      await sendTextMessage(phoneNumberId, numero, token,
-        `Anotado: ${label}. Mais algum serviço ou digite 'pronto' para continuar.`
-      );
-      return;
+    const servicos = await extractServicos(texto);
+    dados.servicos = servicos;
+    // pula quantidade se só tem "outro"
+    const temQtd = servicos.some((s) => s !== 'outro');
+    if (!temQtd && !state.skipSteps.includes('quantidade')) {
+      state.skipSteps.push('quantidade');
     }
-
-    // texto livre não reconhecido: reapresenta a lista
-    await sendStepQuestion(phoneNumberId, numero, token, 'servico', state);
-    return;
+    const next = nextStepAfter('servico', state.skipSteps);
+    state.step = next;
+    await sendStepQuestion(phoneNumberId, numero, token, next, state);
+    return true;
   }
 
   // ── imovel ──
   if (step === 'imovel') {
+    if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
     dados.tipoImovel = texto;
     const next = nextStepAfter('imovel', state.skipSteps);
     state.step = next;
     await sendStepQuestion(phoneNumberId, numero, token, next, state);
-    return;
+    return true;
   }
 
   // ── estagio ──
   if (step === 'estagio') {
+    if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
     dados.estagioObra = texto;
     const next = nextStepAfter('estagio', state.skipSteps);
     state.step = next;
     await sendStepQuestion(phoneNumberId, numero, token, next, state);
-    return;
+    return true;
   }
 
   // ── quantidade: loop ──
   if (step === 'quantidade') {
+    if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
     const servicosComQtd = dados.servicos.filter((s) => s !== 'outro');
     const idx = state.quantidadeIndex;
     if (idx < servicosComQtd.length) {
@@ -321,34 +358,33 @@ async function handleQualification(phoneNumberId, numero, token, texto, state) {
       state.quantidadeIndex++;
     }
     if (state.quantidadeIndex < servicosComQtd.length) {
-      // ainda há serviços para perguntar
       await sendStepQuestion(phoneNumberId, numero, token, 'quantidade', state);
-      return;
+      return true;
     }
-    // todos respondidos
     const next = nextStepAfter('quantidade', state.skipSteps);
     state.step = next;
     await sendStepQuestion(phoneNumberId, numero, token, next, state);
-    return;
+    return true;
   }
 
   // ── localizacao ──
   if (step === 'localizacao') {
+    if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
     dados.localizacao = texto;
     const next = nextStepAfter('localizacao', state.skipSteps);
     state.step = next;
     await sendStepQuestion(phoneNumberId, numero, token, next, state);
-    return;
+    return true;
   }
 
   // ── encerramento ──
   if (step === 'encerramento') {
+    if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
     state.step = 'livre';
-    // cai no fluxo livre abaixo (retorna false para indicar que deve continuar com Claude)
-    return false;
+    return false; // sinaliza para cair no Claude
   }
 
-  return true; // mensagem tratada pela state machine
+  return true;
 }
 
 // ─── Conversation history ─────────────────────────────────────────────────────
