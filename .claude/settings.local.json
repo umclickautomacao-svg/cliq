@@ -9,7 +9,8 @@
       "Bash(powershell -Command 'Stop-Process -Id \\(Get-NetTCPConnection -LocalPort 3000\\).OwningProcess -Force')",
       "Bash(npm start:*)",
       "Bash(powershell -Command \"Stop-Process -Id \\(Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue\\).OwningProcess -Force -ErrorAction SilentlyContinue; echo 'ok'\")",
-      "Bash(printf 'node_modules\\\\n.env\\\\n*.log\\\\n')"
+      "Bash(printf 'node_modules\\\\n.env\\\\n*.log\\\\n')",
+      "Bash(node:*)"
     ]
   },
   "disabledMcpjsonServers": [
