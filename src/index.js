@@ -290,6 +290,25 @@ async function analyzeFirstMessage(texto, contexto) {
   }
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const QUESTION_PREFIXES = ['o que', 'como', 'qual', 'quanto', 'pode', 'é possível', 'tem como', 'vocês fazem', 'o que é'];
+
+function isQuestion(texto) {
+  if (texto.includes('?')) return true;
+  const lower = texto.trim().toLowerCase();
+  return QUESTION_PREFIXES.some((p) => lower.startsWith(p));
+}
+
+function buildLeadContext(dados) {
+  const servicos = dados.servicos?.join(', ') || '-';
+  const imovel   = dados.tipoImovel  || '-';
+  const estagio  = dados.estagioObra || '-';
+  const local    = dados.localizacao  || '-';
+  const escolha  = dados.escolhaEncerramento || '-';
+  return `[DADOS DO LEAD: Serviços: ${servicos}. Imóvel: ${imovel}. Estágio: ${estagio}. Localização: ${local}. Escolha: ${escolha}]`;
+}
+
 // ─── Qualification handler ────────────────────────────────────────────────────
 
 async function goBack(phoneNumberId, numero, token, state) {
@@ -305,9 +324,22 @@ async function goBack(phoneNumberId, numero, token, state) {
   await sendStepQuestion(phoneNumberId, numero, token, prev, state);
 }
 
-async function handleQualification(phoneNumberId, numero, token, texto, state) {
+async function handleQualification(phoneNumberId, numero, token, texto, state, systemPrompt) {
   const { step, dados } = state;
   const textoNorm = texto.trim().toLowerCase();
+
+  // ── intercept: pergunta durante qualificação ──
+  if (isQuestion(texto)) {
+    const r = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 256,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: `${texto}\n\nO cliente fez uma pergunta durante o processo de qualificação. Responda de forma curta e objetiva (máximo 2 frases, sem emoji). Depois NÃO faça perguntas de volta.` }],
+    });
+    await sendTextMessage(phoneNumberId, numero, token, r.content[0].text);
+    await sendStepQuestion(phoneNumberId, numero, token, step, state);
+    return true;
+  }
 
   // ── servico: texto livre → Claude extrai serviços ──
   if (step === 'servico') {
@@ -380,8 +412,20 @@ async function handleQualification(phoneNumberId, numero, token, texto, state) {
   // ── encerramento ──
   if (step === 'encerramento') {
     if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
+
+    const MSGS_ENCERRAMENTO = {
+      'receber proposta aqui': 'Perfeito. Vou preparar uma proposta com base nas suas informações e envio por aqui em breve. Obrigado pelo contato!',
+      'agendar visita técnica': 'Vou encaminhar para o Alê agendar a visita técnica com você. Ele entra em contato em breve. Obrigado!',
+      'falar com consultor':   'Vou conectar você com o Alê agora. Ele responde em instantes. Obrigado!',
+    };
+
+    const msgEncerramento = MSGS_ENCERRAMENTO[textoNorm] ?? MSGS_ENCERRAMENTO['receber proposta aqui'];
+    dados.escolhaEncerramento = texto;
     state.step = 'livre';
-    return false; // sinaliza para cair no Claude
+
+    await sendTextMessage(phoneNumberId, numero, token, msgEncerramento);
+    console.log('=== LEAD QUALIFICADO ===', JSON.stringify({ numero, dados }, null, 2));
+    return true;
   }
 
   return true;
@@ -561,20 +605,20 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     // ── QUALIFICAÇÃO em andamento ──
     if (state.step !== 'livre') {
-      const handled = await handleQualification(phoneNumberId, numero, whatsappToken, texto, state);
-      // handleQualification retorna false apenas no encerramento (para cair no Claude livre)
+      const handled = await handleQualification(phoneNumberId, numero, whatsappToken, texto, state, client.systemPrompt);
       if (handled !== false) {
         await upsertContact(numero, contactName);
         return res.sendStatus(200);
       }
-      // se retornou false, continua para o Claude abaixo
+      // retornou false → step encerramento levou a livre; continua para Claude abaixo
     }
 
     // ── MODO LIVRE: Claude normal ──
-    const contexto = origem === 'ad'
+    const origemCtx = origem === 'ad'
       ? `[CONTEXTO: cliente veio do anúncio ${anuncioInfo}. Origem: ad]`
       : '[CONTEXTO: cliente chegou por contato direto]';
-    const textoComContexto = `${contexto}\n${texto}`;
+    const leadCtx = buildLeadContext(state?.dados ?? {});
+    const textoComContexto = `${origemCtx}\n${leadCtx}\n${texto}`;
 
     addMessage(numero, 'user', textoComContexto);
     const { messages } = getHistory(numero);
