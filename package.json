@@ -11,6 +11,7 @@
     "@anthropic-ai/sdk": "^0.39.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "googleapis": "^144.0.0",
     "ruflo": "^3.5.48"
   }
 }

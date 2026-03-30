@@ -60,7 +60,33 @@ QUANDO ESCALAR PARA HUMANO:
 
 - Lead de parceria (arquiteto/engenheiro/incorporadora)
 
-- Cliente quer agendar visita técnica`,
+- Cliente quer agendar visita técnica
+
+CONHECIMENTO SOBRE SERVIÇOS:
+
+Automação de iluminação: acendimento automático por presença, voz ou app. Dimerização (controle de intensidade). Cenas personalizadas como "Cinema", "Jantar", "Acordar".
+
+Ar-condicionado e ventilação: ligar/desligar por voz, app ou geolocalização. Integração com cenas.
+
+Entretenimento: TVs, projetores e som controlados por voz/app. Som ambiente multi-área. Flap de TV automático.
+
+Cortinas e persianas: abertura/fechamento por horário, sensor ou comando. Simulação de presença.
+
+Segurança: câmeras com acesso remoto, fechaduras digitais (facial, biometria, senha, app), sensores de movimento/fumaça/gás/água, portões automatizados.
+
+Sonorização: home theater para sala de cinema ou estar. Som ambiente por cômodo, podendo reproduzir sons diferentes ou o mesmo em todos.
+
+Tipos de automação oferecidos:
+* Cabeada: painel central, cabos para interruptores/luzes/persianas, controle IR no forro, dimerização, app próprio customizado.
+* Não cabeada: interruptores inteligentes com controle direto, controles remotos em pontos estratégicos, app genérico.
+
+Também oferecemos: internet cabeada/Wi-Fi estruturada e aspiração central.
+
+Fases: diagnóstico → projeto e proposta (até 3 dias úteis) → orçamento → instalação (depende do tamanho) → configuração → testes e entrega.
+
+Parcelamento disponível.
+
+REGRA: quando o cliente perguntar sobre um serviço, responda com no máximo 3 frases usando este conhecimento. Não liste tudo, responda só o que foi perguntado.`,
     whatsappToken: process.env.WHATSAPP_TOKEN,
   },
 };
@@ -185,7 +211,7 @@ async function sendInteractiveList(phoneNumberId, to, token, bodyText, buttonTex
 async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
   if (step === 'servico') {
     await sendTextMessage(phoneNumberId, numero, token,
-      "O que você tem interesse? Pode digitar tudo de uma vez, por exemplo: 'fechadura e sonorização' ou 'quero automatizar tudo'."
+      "O que você tem interesse?\nNossos serviços são:\nAutomação de fechadura inteligente, iluminação, ar-condicionado, cortinas/persianas\nSonorização, entretenimento (TV/projetor)\nCâmeras e controle de acesso\nInternet cabeada/Wi-Fi"
     );
     return;
   }
@@ -209,9 +235,9 @@ async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
       'Em que estágio está o imóvel?',
       'Selecionar',
       [{ title: 'Estágio', rows: [
-        { id: 'pronto',    title: 'Pronto/morando' },
-        { id: 'reforma',   title: 'Em reforma' },
-        { id: 'construcao',title: 'Em construção' },
+        { id: 'pronto',  title: 'Pronto/morando' },
+        { id: 'reforma', title: 'Em reforma' },
+        { id: 'planta',  title: 'Em projeto/planta' },
         { id: 'voltar',    title: 'Voltar' },
       ]}]
     );
@@ -287,6 +313,111 @@ async function analyzeFirstMessage(texto, contexto) {
     return JSON.parse(r.content[0].text);
   } catch {
     return { skipSteps: [], dados: { servicos: [], quantidades: {} }, saudacao: 'Olá! Bem-vindo à Um Click Automação.' };
+  }
+}
+
+// ─── Nome do cliente ──────────────────────────────────────────────────────────
+
+const NOMES_GENERICOS = new Set(['teste', 'test', 'usuario', 'user', 'cliente', 'whatsapp', 'business', 'empresa']);
+const EMOJI_REGEX = /\p{Emoji_Presentation}|\p{Extended_Pictographic}/u;
+
+function isValidName(name) {
+  if (!name || name.length < 2) return false;
+  if (EMOJI_REGEX.test(name)) return false;
+  if (/^\d+$/.test(name)) return false;
+  const specialCount = (name.match(/[^a-zA-ZÀ-ÿ\s]/g) ?? []).length;
+  if (specialCount > 2) return false;
+  if (NOMES_GENERICOS.has(name.trim().toLowerCase())) return false;
+  return true;
+}
+
+function extractFirstName(name) {
+  if (!isValidName(name)) return null;
+  const first = name.trim().split(/\s+/)[0];
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
+// ─── Cidades atendidas ────────────────────────────────────────────────────────
+
+const CIDADES_ATENDIDAS = [
+  'sao paulo','guarulhos','osasco','barueri','santana de parnaiba','alphaville','cotia',
+  'carapicuiba','jandira','itapevi','sao bernardo do campo','santo andre','sao caetano do sul',
+  'ribeirao pires','mogi das cruzes','suzano','aruja','guararema','santos','sao vicente',
+  'guaruja','praia grande','cubatao','bertioga','mongagua','itanhaem','peruibe','campinas',
+  'jundiai','valinhos','vinhedo','louveira','indaiatuba','salto','itu','sorocaba',
+  'sao jose dos campos','jacarei','taubate','cacapava','atibaia','braganca paulista',
+  'itatiba','itapecerica da serra',
+];
+
+function normalizeStr(str) {
+  return str.toLowerCase().trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function cidadeAtendida(texto) {
+  const norm = normalizeStr(texto);
+  return CIDADES_ATENDIDAS.find((c) => norm.includes(c)) ?? null;
+}
+
+// ─── Google Sheets ────────────────────────────────────────────────────────────
+
+async function appendLeadToSheet(dados) {
+  try {
+    const credsJson = process.env.GOOGLE_SHEETS_CREDENTIALS;
+    const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
+    if (!credsJson || !spreadsheetId) return;
+
+    const { google } = await import('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+    const now = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'Sheet1!A:J',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          now,
+          dados.nome ?? '',
+          dados.telefone ?? '',
+          (dados.servicos ?? []).join(', '),
+          dados.tipoImovel ?? '',
+          dados.estagioObra ?? '',
+          dados.localizacao ?? '',
+          dados.escolhaEncerramento ?? '',
+          dados.origem ?? '',
+          dados.anuncio ?? '',
+        ]],
+      },
+    });
+  } catch (err) {
+    console.error('Erro ao salvar no Google Sheets:', err.message);
+  }
+}
+
+// ─── Notificação pro Alê ──────────────────────────────────────────────────────
+
+const ALE_NUMERO = '5511971873887';
+
+async function notificarAle(phoneNumberId, token, dados) {
+  const msg = [
+    'Novo lead qualificado!',
+    `Nome: ${dados.nome ?? '-'}`,
+    `Telefone: ${dados.telefone ?? '-'}`,
+    `Serviços: ${(dados.servicos ?? []).join(', ') || '-'}`,
+    `Imóvel: ${dados.tipoImovel ?? '-'}`,
+    `Estágio: ${dados.estagioObra ?? '-'}`,
+    `Cidade: ${dados.localizacao ?? '-'}`,
+    `Escolha: ${dados.escolhaEncerramento ?? '-'}`,
+  ].join('\n');
+  try {
+    await sendTextMessage(phoneNumberId, ALE_NUMERO, token, msg);
+  } catch (err) {
+    console.error('Erro ao notificar Alê:', err.message);
   }
 }
 
@@ -402,7 +533,19 @@ async function handleQualification(phoneNumberId, numero, token, texto, state, s
   // ── localizacao ──
   if (step === 'localizacao') {
     if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
-    dados.localizacao = texto;
+    const cidade = cidadeAtendida(texto);
+    if (!cidade) {
+      dados.localizacao = texto;
+      state.step = 'livre';
+      await sendTextMessage(phoneNumberId, numero, token,
+        'No momento atendemos a Grande São Paulo, litoral e interior até Campinas/São José dos Campos. Vou encaminhar pro Alê avaliar a possibilidade de encontrar um parceiro para atender sua região. Obrigado pelo contato!'
+      );
+      console.log('=== LEAD FORA DE ÁREA ===', JSON.stringify({ numero, dados }, null, 2));
+      await notificarAle(phoneNumberId, token, { ...dados, telefone: numero });
+      await appendLeadToSheet({ ...dados, telefone: numero });
+      return true;
+    }
+    dados.localizacao = cidade;
     const next = nextStepAfter('localizacao', state.skipSteps);
     state.step = next;
     await sendStepQuestion(phoneNumberId, numero, token, next, state);
@@ -413,18 +556,30 @@ async function handleQualification(phoneNumberId, numero, token, texto, state, s
   if (step === 'encerramento') {
     if (textoNorm === 'voltar') { await goBack(phoneNumberId, numero, token, state); return true; }
 
+    const primeiroNome = extractFirstName(dados.nome);
+    const saudacaoNome = primeiroNome ? `${primeiroNome}` : null;
+
     const MSGS_ENCERRAMENTO = {
-      'receber proposta aqui': 'Perfeito. Vou preparar uma proposta com base nas suas informações e envio por aqui em breve. Obrigado pelo contato!',
-      'agendar visita técnica': 'Vou encaminhar para o Alê agendar a visita técnica com você. Ele entra em contato em breve. Obrigado!',
-      'falar com consultor':   'Vou conectar você com o Alê agora. Ele responde em instantes. Obrigado!',
+      'receber proposta aqui': saudacaoNome
+        ? `Perfeito, ${saudacaoNome}. Para montar uma proposta precisa, o Alê vai entrar em contato para alinhar alguns detalhes como quantidades, projeto e preferências. Ele fala com você em breve!`
+        : 'Perfeito. Para montar uma proposta precisa, o Alê vai entrar em contato para alinhar alguns detalhes. Ele fala com você em breve!',
+      'agendar visita técnica': saudacaoNome
+        ? `Ótimo, ${saudacaoNome}. O Alê vai entrar em contato para agendar a visita técnica no melhor horário para você.`
+        : 'Ótimo. O Alê vai entrar em contato para agendar a visita técnica no melhor horário para você.',
+      'falar com consultor': saudacaoNome
+        ? `Certo, ${saudacaoNome}. O Alê já foi notificado e responde em instantes.`
+        : 'Certo. O Alê já foi notificado e responde em instantes.',
     };
 
-    const msgEncerramento = MSGS_ENCERRAMENTO[textoNorm] ?? MSGS_ENCERRAMENTO['receber proposta aqui'];
     dados.escolhaEncerramento = texto;
     state.step = 'livre';
 
+    const msgEncerramento = MSGS_ENCERRAMENTO[textoNorm] ?? MSGS_ENCERRAMENTO['receber proposta aqui'];
     await sendTextMessage(phoneNumberId, numero, token, msgEncerramento);
     console.log('=== LEAD QUALIFICADO ===', JSON.stringify({ numero, dados }, null, 2));
+
+    await notificarAle(phoneNumberId, token, { ...dados, telefone: numero });
+    await appendLeadToSheet({ ...dados, telefone: numero });
     return true;
   }
 
@@ -574,6 +729,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     const { whatsappToken } = client;
     const contactName = change?.value?.contacts?.[0]?.profile?.name;
+    const primeiroNome = extractFirstName(contactName);
 
     // ── PRIMEIRA MENSAGEM: analisa e inicializa state machine ──
     if (!leadState[numero]) {
@@ -583,12 +739,16 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
       const analysis = await analyzeFirstMessage(texto, contexto);
       const state = initLead(numero, origem, anuncioInfo);
+      state.dados.nome = isValidName(contactName) ? contactName : null;
       state.skipSteps = analysis.skipSteps ?? [];
       if (analysis.dados?.servicos?.length) state.dados.servicos = analysis.dados.servicos;
       if (analysis.dados?.quantidades) state.dados.quantidades = analysis.dados.quantidades;
 
-      // Envia saudação
-      await sendTextMessage(phoneNumberId, numero, whatsappToken, analysis.saudacao);
+      // Saudação com nome se válido
+      const saudacao = primeiroNome
+        ? `Olá, ${primeiroNome}. Bem-vindo à Um Click Automação.`
+        : analysis.saudacao;
+      await sendTextMessage(phoneNumberId, numero, whatsappToken, saudacao);
 
       // Avança para o primeiro step não-pulado
       const firstStep = nextStepAfter('', state.skipSteps.includes('servico') ? 'servico' : '');
