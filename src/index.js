@@ -12,39 +12,350 @@ app.use(express.json());
 const CLIENTS = {
   '1112302711964826': {
     name: 'Um Click Automação',
-    systemPrompt: `Você é o assistente virtual da Um Click Automação, empresa especializada em automação residencial, sonorização, câmeras, fechaduras eletrônicas e controle de acesso em São Paulo, além de instalação de internet cabeada e Wi-Fi para todos os ambientes do imóvel.
+    systemPrompt: `Você é o assistente virtual da Um Click Automação.
 
-Seu objetivo é qualificar o lead e encaminhar para o próximo passo correto.
+A Um Click é especializada em automação residencial e corporativa: fechaduras inteligentes, interruptores inteligentes, internet cabeada ou wi-fi, sonorização, câmeras de segurança, controle de acesso e automação completa de ambientes.
 
-PASSO 1 - IDENTIFICAR ORIGEM:
-Pergunte de forma natural como a pessoa chegou até a Um Click: veio por indicação de alguma loja (EKAZA ou Nova Digital), viu um anúncio, ou encontrou pelo Instagram?
+Região de atuação: tudo que estiver entre: baixada santista, barueri, campinas, são jose dos campos. toda sao paulo e toda grande sao paulo
 
-PASSO 2 - ENTENDER O MOMENTO:
-Pergunte em que fase está o projeto/obra. Se ainda está no começo ou planejamento, pergunte quando estima que vai estar mais pronto para a automação.
+REGRAS DE COMPORTAMENTO:
 
-PASSO 3 - QUALIFICAR:
-- Se está pronto agora ou em menos de 60 dias → tente agendar visita técnica gratuita. Peça nome completo, endereço do imóvel e melhor horário.
-- Se tem projeto → peça para enviar o projeto e agende visita.
-- Se está longe (mais de 60 dias) → seja caloroso, diga que vai guardar o contato e pergunte quando seria um bom momento para retomar o contato. Registre isso.
-- Se é arquiteto, engenheiro ou incorporadora → trate como parceiro potencial, pergunte sobre os projetos em andamento e diga que a Um Click tem condições especiais para parceiros.
+- Nunca use emojis.
 
-PASSO 4 - COLETAR DADOS PARA ORÇAMENTO (se não puder visita):
-Pergunte: quantidade de interruptores e teclas, ares condicionados, televisores, persianas motorizadas e o endereço do imóvel.
+- Seja direto, profissional e objetivo.
 
-REGRAS:
-- Seja simpático, direto e profissional. Nunca robótico.
-- Nunca invente preços ou prazos.
-- Se a pessoa perguntar algo técnico que você não sabe, diga que vai verificar com a equipe.
-- Sempre termine coletando nome e contato se ainda não tiver.
-- Máximo 2 perguntas por mensagem para não sobrecarregar.`,
+- Use frases curtas. Máximo de 2-3 linhas por mensagem.
+
+- Sempre que possível, ofereça opções para o cliente selecionar em vez de perguntas abertas.
+
+- Não dê preços exatos. Diga que o orçamento depende do dimensionamento do projeto.
+
+- Não invente informações técnicas que você não tem certeza.
+
+FLUXO DE QUALIFICAÇÃO:
+
+Siga a sequência: saudação → tipo de serviço → tipo de imóvel → estágio da obra → quantidade → localização → encerramento.
+
+Faça uma pergunta por vez. Não pule etapas.
+
+ORIGEM DO LEAD:
+
+Se o campo "origem" indicar "ad", o cliente veio de um anúncio.
+
+Nesse caso, NÃO pergunte como ele chegou até a empresa. Vá direto para a qualificação.
+
+Se o campo "origem" indicar "direto", pergunte como chegou (anúncio, indicação, Instagram, outro).
+
+PERFIS ESPECIAIS:
+
+Se o cliente mencionar que é arquiteto, engenheiro civil, dono de incorporadora ou construtora, trate como lead de parceria. Pergunte sobre o porte dos projetos e ofereça uma reunião com o Alê (proprietário) para discutir parceria.
+
+QUANDO ESCALAR PARA HUMANO:
+
+- Cliente pede para falar com uma pessoa
+
+- Dúvida técnica que foge do escopo do bot
+
+- Reclamação
+
+- Lead de parceria (arquiteto/engenheiro/incorporadora)
+
+- Cliente quer agendar visita técnica`,
     whatsappToken: process.env.WHATSAPP_TOKEN,
   },
 };
 
-const MAX_HISTORY = 10;
-const CONVERSATION_TTL = 60 * 60 * 1000; // 1 hora em ms
+// ─── State Machine ────────────────────────────────────────────────────────────
 
-// { numero: { messages: [...], lastActivity: timestamp } }
+const STEP_ORDER = ['servico', 'imovel', 'estagio', 'quantidade', 'localizacao', 'encerramento'];
+
+const SERVICOS_LIST = [
+  { id: 'fechadura', title: 'Fechadura inteligente' },
+  { id: 'iluminacao', title: 'Iluminação/interruptores' },
+  { id: 'sonorizacao', title: 'Sonorização' },
+  { id: 'cameras', title: 'Câmeras de segurança' },
+  { id: 'acesso', title: 'Controle de acesso' },
+  { id: 'internet', title: 'Internet cabeada/Wi-Fi' },
+  { id: 'automacao', title: 'Automação completa' },
+  { id: 'outro', title: 'Outro' },
+];
+
+const QUANTITY_BUTTONS = {
+  fechadura:  [{ id: 'q1', title: '1 porta' },       { id: 'q2', title: '2 a 3' },         { id: 'q3', title: '4+' }],
+  iluminacao: [{ id: 'q1', title: 'Até 3 ambientes'}, { id: 'q2', title: '4 a 8' },         { id: 'q3', title: 'Mais de 8' }],
+  sonorizacao:[{ id: 'q1', title: '1 ambiente' },     { id: 'q2', title: '2 a 4' },         { id: 'q3', title: 'Mais de 4' }],
+  cameras:    [{ id: 'q1', title: '1 a 2' },          { id: 'q2', title: '3 a 5' },         { id: 'q3', title: 'Mais de 5' }],
+  acesso:     [{ id: 'q1', title: '1 ponto' },        { id: 'q2', title: '2 a 3' },         { id: 'q3', title: '4+' }],
+  internet:   [{ id: 'q1', title: 'Até 3 ambientes'}, { id: 'q2', title: '4 a 8' },         { id: 'q3', title: 'Mais de 8' }],
+  automacao:  [{ id: 'q1', title: 'Até 5 ambientes'}, { id: 'q2', title: '6 a 10' },        { id: 'q3', title: 'Mais de 10' }],
+};
+
+const leadState = {};
+
+function initLead(numero, origem, anuncio) {
+  leadState[numero] = {
+    step: 'inicio',
+    dados: { origem, anuncio, servicos: [], tipoImovel: null, estagioObra: null, quantidades: {}, localizacao: null },
+    skipSteps: [],
+    quantidadeIndex: 0,
+  };
+  return leadState[numero];
+}
+
+function getNextStep(state) {
+  for (const s of STEP_ORDER) {
+    if (!state.skipSteps.includes(s) && state.step !== s) {
+      if (STEP_ORDER.indexOf(s) > STEP_ORDER.indexOf(state.step === 'inicio' ? '' : state.step)) {
+        return s;
+      }
+    }
+  }
+  return 'livre';
+}
+
+function nextStepAfter(currentStep, skipSteps) {
+  const idx = STEP_ORDER.indexOf(currentStep);
+  for (let i = idx + 1; i < STEP_ORDER.length; i++) {
+    if (!skipSteps.includes(STEP_ORDER[i])) return STEP_ORDER[i];
+  }
+  return 'livre';
+}
+
+const PRONTO_REGEX = /^(pronto|só isso|so isso|é só|e só|tudo|ok|fim|done|encerrar|terminar|continuar)$/i;
+
+// ─── WhatsApp helpers ─────────────────────────────────────────────────────────
+
+async function sendTextMessage(phoneNumberId, to, token, text) {
+  return fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+  });
+}
+
+async function sendInteractiveButtons(phoneNumberId, to, token, bodyText, buttons) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: bodyText },
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: b.title },
+        })),
+      },
+    },
+  };
+  return fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function sendInteractiveList(phoneNumberId, to, token, bodyText, buttonText, sections) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: { text: bodyText },
+      action: { button: buttonText, sections },
+    },
+  };
+  return fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ─── Step sender ──────────────────────────────────────────────────────────────
+
+async function sendStepQuestion(phoneNumberId, numero, token, step, state) {
+  if (step === 'servico') {
+    await sendInteractiveList(phoneNumberId, numero, token,
+      'Qual serviço você precisa?',
+      'Ver opções',
+      [{ title: 'Serviços', rows: SERVICOS_LIST.map((s) => ({ id: s.id, title: s.title })) }]
+    );
+    await sendTextMessage(phoneNumberId, numero, token,
+      "Selecione um serviço por vez. Quando terminar, digite 'pronto'."
+    );
+    return;
+  }
+
+  if (step === 'imovel') {
+    await sendInteractiveButtons(phoneNumberId, numero, token,
+      'Qual é o tipo do imóvel?',
+      [{ id: 'casa', title: 'Casa' }, { id: 'apartamento', title: 'Apartamento' }, { id: 'comercial', title: 'Comercial' }]
+    );
+    return;
+  }
+
+  if (step === 'estagio') {
+    await sendInteractiveButtons(phoneNumberId, numero, token,
+      'Em que estágio está o imóvel?',
+      [{ id: 'pronto', title: 'Pronto/morando' }, { id: 'reforma', title: 'Em reforma' }, { id: 'construcao', title: 'Em construção' }]
+    );
+    return;
+  }
+
+  if (step === 'quantidade') {
+    const servicos = state.dados.servicos.filter((s) => s !== 'outro');
+    const idx = state.quantidadeIndex;
+    if (idx >= servicos.length) return; // será tratado pela lógica de avanço
+    const servico = servicos[idx];
+    const buttons = QUANTITY_BUTTONS[servico];
+    const label = SERVICOS_LIST.find((s) => s.id === servico)?.title ?? servico;
+    await sendInteractiveButtons(phoneNumberId, numero, token,
+      `Quantas unidades para ${label}?`,
+      buttons
+    );
+    return;
+  }
+
+  if (step === 'localizacao') {
+    await sendTextMessage(phoneNumberId, numero, token, 'Em qual cidade ou região você está?');
+    return;
+  }
+
+  if (step === 'encerramento') {
+    await sendInteractiveButtons(phoneNumberId, numero, token,
+      'Ótimo! Coletamos tudo que precisamos. Como prefere prosseguir?',
+      [
+        { id: 'proposta', title: 'Receber proposta aqui' },
+        { id: 'visita', title: 'Agendar visita técnica' },
+        { id: 'consultor', title: 'Falar com consultor' },
+      ]
+    );
+    return;
+  }
+}
+
+// ─── First message analysis ───────────────────────────────────────────────────
+
+async function analyzeFirstMessage(texto, contexto) {
+  const prompt = `Analise a primeira mensagem deste lead e o contexto de origem. Responda APENAS com um JSON válido sem markdown: { "skipSteps": ["servico", "quantidade", etc], "dados": { "servicos": ["fechadura"] ou [], "quantidades": {} }, "saudacao": "texto da saudação personalizada sem emoji, máximo 2 linhas" }. Skip steps que já podem ser inferidos da mensagem ou do anúncio. Se o anúncio é sobre um serviço específico, inclua esse serviço em dados.servicos e adicione servico em skipSteps.\n\nContexto: ${contexto}\nMensagem: ${texto}`;
+
+  const r = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 512,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  try {
+    return JSON.parse(r.content[0].text);
+  } catch {
+    return { skipSteps: [], dados: { servicos: [], quantidades: {} }, saudacao: 'Olá! Bem-vindo à Um Click Automação.' };
+  }
+}
+
+// ─── Qualification handler ────────────────────────────────────────────────────
+
+async function handleQualification(phoneNumberId, numero, token, texto, state) {
+  const { step, dados } = state;
+
+  // ── servico: múltipla seleção ──
+  if (step === 'servico') {
+    if (PRONTO_REGEX.test(texto.trim())) {
+      if (dados.servicos.length === 0) {
+        await sendTextMessage(phoneNumberId, numero, token, 'Selecione ao menos um serviço antes de continuar.');
+        return;
+      }
+      // adiciona "quantidade" a skipSteps se todos os serviços são "outro"
+      const next = nextStepAfter('servico', state.skipSteps);
+      state.step = next;
+      await sendStepQuestion(phoneNumberId, numero, token, next, state);
+      return;
+    }
+
+    // verifica se é seleção de serviço (lista interativa ou texto)
+    const servicoSelecionado = SERVICOS_LIST.find(
+      (s) => s.id === texto || s.title.toLowerCase() === texto.toLowerCase()
+    );
+    if (servicoSelecionado) {
+      if (!dados.servicos.includes(servicoSelecionado.id)) {
+        dados.servicos.push(servicoSelecionado.id);
+      }
+      const label = servicoSelecionado.title;
+      await sendTextMessage(phoneNumberId, numero, token,
+        `Anotado: ${label}. Mais algum serviço ou digite 'pronto' para continuar.`
+      );
+      return;
+    }
+
+    // texto livre não reconhecido: reapresenta a lista
+    await sendStepQuestion(phoneNumberId, numero, token, 'servico', state);
+    return;
+  }
+
+  // ── imovel ──
+  if (step === 'imovel') {
+    dados.tipoImovel = texto;
+    const next = nextStepAfter('imovel', state.skipSteps);
+    state.step = next;
+    await sendStepQuestion(phoneNumberId, numero, token, next, state);
+    return;
+  }
+
+  // ── estagio ──
+  if (step === 'estagio') {
+    dados.estagioObra = texto;
+    const next = nextStepAfter('estagio', state.skipSteps);
+    state.step = next;
+    await sendStepQuestion(phoneNumberId, numero, token, next, state);
+    return;
+  }
+
+  // ── quantidade: loop ──
+  if (step === 'quantidade') {
+    const servicosComQtd = dados.servicos.filter((s) => s !== 'outro');
+    const idx = state.quantidadeIndex;
+    if (idx < servicosComQtd.length) {
+      dados.quantidades[servicosComQtd[idx]] = texto;
+      state.quantidadeIndex++;
+    }
+    if (state.quantidadeIndex < servicosComQtd.length) {
+      // ainda há serviços para perguntar
+      await sendStepQuestion(phoneNumberId, numero, token, 'quantidade', state);
+      return;
+    }
+    // todos respondidos
+    const next = nextStepAfter('quantidade', state.skipSteps);
+    state.step = next;
+    await sendStepQuestion(phoneNumberId, numero, token, next, state);
+    return;
+  }
+
+  // ── localizacao ──
+  if (step === 'localizacao') {
+    dados.localizacao = texto;
+    const next = nextStepAfter('localizacao', state.skipSteps);
+    state.step = next;
+    await sendStepQuestion(phoneNumberId, numero, token, next, state);
+    return;
+  }
+
+  // ── encerramento ──
+  if (step === 'encerramento') {
+    state.step = 'livre';
+    // cai no fluxo livre abaixo (retorna false para indicar que deve continuar com Claude)
+    return false;
+  }
+
+  return true; // mensagem tratada pela state machine
+}
+
+// ─── Conversation history ─────────────────────────────────────────────────────
+
+const MAX_HISTORY = 10;
+const CONVERSATION_TTL = 60 * 60 * 1000;
+
 const conversationHistory = new Map();
 
 setInterval(() => {
@@ -52,9 +363,10 @@ setInterval(() => {
   for (const [numero, data] of conversationHistory) {
     if (now - data.lastActivity > CONVERSATION_TTL) {
       conversationHistory.delete(numero);
+      delete leadState[numero];
     }
   }
-}, 5 * 60 * 1000); // verifica a cada 5 minutos
+}, 5 * 60 * 1000);
 
 function getHistory(numero) {
   if (!conversationHistory.has(numero)) {
@@ -62,6 +374,17 @@ function getHistory(numero) {
   }
   return conversationHistory.get(numero);
 }
+
+function addMessage(numero, role, content) {
+  const conv = getHistory(numero);
+  conv.messages.push({ role, content });
+  conv.lastActivity = Date.now();
+  if (conv.messages.length > MAX_HISTORY) {
+    conv.messages.shift();
+  }
+}
+
+// ─── Supabase ─────────────────────────────────────────────────────────────────
 
 async function upsertContact(numero, name) {
   try {
@@ -73,18 +396,13 @@ async function upsertContact(numero, name) {
       'Authorization': `Bearer ${supabaseKey}`,
     };
 
-    // Busca o primeiro organization_id
     const orgRes = await fetch(`${supabaseUrl}/rest/v1/organizations?select=id&limit=1`, { headers });
     const orgs = await orgRes.json();
     const organizationId = orgs?.[0]?.id ?? null;
 
-    // Upsert: cria ou atualiza pelo phone
     await fetch(`${supabaseUrl}/rest/v1/contacts`, {
       method: 'POST',
-      headers: {
-        ...headers,
-        'Prefer': 'resolution=merge-duplicates',
-      },
+      headers: { ...headers, 'Prefer': 'resolution=merge-duplicates' },
       body: JSON.stringify({
         phone: numero,
         name: name || numero,
@@ -98,14 +416,7 @@ async function upsertContact(numero, name) {
   }
 }
 
-function addMessage(numero, role, content) {
-  const conv = getHistory(numero);
-  conv.messages.push({ role, content });
-  conv.lastActivity = Date.now();
-  if (conv.messages.length > MAX_HISTORY) {
-    conv.messages.shift();
-  }
-}
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', name: 'Cliq', version: '0.1.0' });
@@ -152,66 +463,103 @@ app.post('/webhook/whatsapp', async (req, res) => {
   const change = entry?.changes?.[0];
   const message = change?.value?.messages?.[0];
   const phoneNumberId = change?.value?.metadata?.phone_number_id;
-
   const client = CLIENTS[phoneNumberId];
 
-  if (message?.text?.body) {
-    const numero = message.from;
-    const texto = message.text.body;
-    console.log(`Mensagem de ${numero}: ${texto}`);
+  if (!message) return res.sendStatus(200);
 
-    try {
-      if (!client) {
-        console.warn(`Cliente não configurado para phone_number_id: ${phoneNumberId}`);
-        await fetch(`https://graph.facebook.com/v19.0/${phoneNumberId}/messages`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          },
-          body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            to: numero,
-            text: { body: 'Serviço não configurado para este número.' },
-          }),
-        });
+  // Extrai texto de mensagem de texto ou resposta interativa
+  let texto = null;
+  if (message.type === 'text') {
+    texto = message.text?.body;
+  } else if (message.type === 'interactive') {
+    texto = message.interactive?.button_reply?.title
+      ?? message.interactive?.list_reply?.title
+      ?? null;
+  }
+
+  if (!texto) return res.sendStatus(200);
+
+  const numero = message.from;
+  const referral = message.referral;
+  const origem = referral ? referral.source_type : 'direto';
+  const anuncioInfo = referral?.headline ?? null;
+  console.log(`Mensagem de ${numero} [origem: ${origem}]: ${texto}`);
+
+  try {
+    if (!client) {
+      console.warn(`Cliente não configurado para phone_number_id: ${phoneNumberId}`);
+      await sendTextMessage(phoneNumberId, numero, process.env.WHATSAPP_TOKEN, 'Serviço não configurado para este número.');
+      return res.sendStatus(200);
+    }
+
+    const { whatsappToken } = client;
+    const contactName = change?.value?.contacts?.[0]?.profile?.name;
+
+    // ── PRIMEIRA MENSAGEM: analisa e inicializa state machine ──
+    if (!leadState[numero]) {
+      const contexto = origem === 'ad'
+        ? `Origem: ad. Anúncio: ${anuncioInfo}`
+        : 'Origem: direto';
+
+      const analysis = await analyzeFirstMessage(texto, contexto);
+      const state = initLead(numero, origem, anuncioInfo);
+      state.skipSteps = analysis.skipSteps ?? [];
+      if (analysis.dados?.servicos?.length) state.dados.servicos = analysis.dados.servicos;
+      if (analysis.dados?.quantidades) state.dados.quantidades = analysis.dados.quantidades;
+
+      // Envia saudação
+      await sendTextMessage(phoneNumberId, numero, whatsappToken, analysis.saudacao);
+
+      // Avança para o primeiro step não-pulado
+      const firstStep = nextStepAfter('', state.skipSteps.includes('servico') ? 'servico' : '');
+      // Encontra o primeiro step da ordem que não está em skipSteps
+      const first = STEP_ORDER.find((s) => !state.skipSteps.includes(s)) ?? 'livre';
+      state.step = first;
+      await sendStepQuestion(phoneNumberId, numero, whatsappToken, first, state);
+
+      await upsertContact(numero, contactName);
+      return res.sendStatus(200);
+    }
+
+    const state = leadState[numero];
+
+    // ── QUALIFICAÇÃO em andamento ──
+    if (state.step !== 'livre') {
+      const handled = await handleQualification(phoneNumberId, numero, whatsappToken, texto, state);
+      // handleQualification retorna false apenas no encerramento (para cair no Claude livre)
+      if (handled !== false) {
+        await upsertContact(numero, contactName);
         return res.sendStatus(200);
       }
-
-      addMessage(numero, 'user', texto);
-      const { messages } = getHistory(numero);
-
-      const claudeResponse = await anthropic.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1024,
-        system: client.systemPrompt,
-        messages,
-      });
-
-      const resposta = claudeResponse.content[0].text;
-      addMessage(numero, 'assistant', resposta);
-      console.log('Resposta Claude:', resposta);
-
-      console.log('Enviando para WhatsApp:', numero, resposta);
-      const whatsappRes = await fetch(`https://graph.facebook.com/v19.0/${phoneNumberId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${client.whatsappToken}`,
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: numero,
-          text: { body: resposta },
-        }),
-      });
-      console.log('Resposta WhatsApp API:', await whatsappRes.json());
-
-      const contactName = change?.value?.contacts?.[0]?.profile?.name;
-      await upsertContact(numero, contactName);
-    } catch (error) {
-      console.error('ERRO COMPLETO:', error);
+      // se retornou false, continua para o Claude abaixo
     }
+
+    // ── MODO LIVRE: Claude normal ──
+    const contexto = origem === 'ad'
+      ? `[CONTEXTO: cliente veio do anúncio ${anuncioInfo}. Origem: ad]`
+      : '[CONTEXTO: cliente chegou por contato direto]';
+    const textoComContexto = `${contexto}\n${texto}`;
+
+    addMessage(numero, 'user', textoComContexto);
+    const { messages } = getHistory(numero);
+
+    const claudeResponse = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      system: client.systemPrompt,
+      messages,
+    });
+
+    const resposta = claudeResponse.content[0].text;
+    addMessage(numero, 'assistant', resposta);
+    console.log('Resposta Claude:', resposta);
+
+    const whatsappRes = await sendTextMessage(phoneNumberId, numero, whatsappToken, resposta);
+    console.log('Resposta WhatsApp API:', await whatsappRes.json());
+
+    await upsertContact(numero, contactName);
+  } catch (error) {
+    console.error('ERRO COMPLETO:', error);
   }
 
   res.sendStatus(200);
